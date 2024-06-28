@@ -19,11 +19,19 @@ Run with:
                                     ...
 """
 
+# CUDA problem on AWS
+# export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+# export LD_LIBRARY_PATH=/usr/local/cuda/include:$LD_LIBRARY_PATH
+# export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/extras/CUPTI/lib64
+
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Tuple, Type
 import draccus
+import json
+import requests
+from io import BytesIO
 
 import numpy as np
 import torch
@@ -37,29 +45,20 @@ from PIL import Image
 from accelerate import PartialState
 from datasets import load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-from transformers import (
-    AutoModelForVision2Seq,
-    AutoProcessor,
-    BitsAndBytesConfig,
-    PreTrainedTokenizerBase
-)
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig, PreTrainedTokenizerBase
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
-from prismatic.models.backbones.llm.prompting import (
-    PromptBuilder,
-    PurePromptBuilder,
-    VicunaV15ChatPromptBuilder
-)
+from prismatic.models.backbones.llm.prompting import PromptBuilder, PurePromptBuilder, VicunaV15ChatPromptBuilder
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 @dataclass
 class FinetuneConfig:
@@ -97,6 +96,8 @@ class FinetuneConfig:
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
+
+
 class HuggingFaceIterableDataset(IterableDataset):
     def __init__(
         self,
@@ -111,9 +112,11 @@ class HuggingFaceIterableDataset(IterableDataset):
         self.base_tokenizer = base_tokenizer
         self.image_transform = image_transform
         self.prompt_builder_fn = prompt_builder_fn
-        
+
         # Load the dataset
-        self.dataset = load_dataset("jxu124/OpenX-Embodiment", "utokyo_xarm_pick_and_place_converted_externally_to_rlds", streaming=True, split='train', trust_remote_code=True)
+        self.dataset = load_dataset(
+            "mbodiai/utokyo_xarm_pick_place_legacy", streaming=True, split="train", trust_remote_code=True
+        )
 
         # # Note =>> We expect the dataset to store statistics for action de-normalization.
         # self.dataset_statistics = {
@@ -125,12 +128,12 @@ class HuggingFaceIterableDataset(IterableDataset):
     def __iter__(self):
         for data in self.dataset:
             # Load data from the dataset
-            # TODO: Replace these several lines.
-            print(data)
-            print(data.keys())
-            image = Image.open(data["image_path"])  # Assuming dataset has image paths
-            action = np.array(data["action"], dtype=np.float32)  # Assuming actions are stored in this format
-            instruction = data["instruction"]  # Assuming instructions are text
+            image = data["observation"]["image"]
+            instruction = data["observation"]["task"]
+            action = np.array(
+                [data["relative_action"]["pose"][k] for k in ["x", "y", "z", "roll", "pitch", "yaw"]]
+                + [data["relative_action"]["grasp"]]
+            )
 
             # Add instruction to VLA prompt
             prompt_builder = self.prompt_builder_fn("openvla")
