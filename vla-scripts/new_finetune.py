@@ -113,7 +113,7 @@ class HuggingFaceIterableDataset(IterableDataset):
         self.prompt_builder_fn = prompt_builder_fn
         
         # Load the dataset
-        self.dataset = load_dataset("jxu124/OpenX-Embodiment", "utokyo_xarm_pick_and_place_converted_externally_to_rlds", streaming=True, split='train')
+        self.dataset = load_dataset("jxu124/OpenX-Embodiment", "utokyo_xarm_pick_and_place_converted_externally_to_rlds", streaming=True, split='train', trust_remote_code=True)
 
         # # Note =>> We expect the dataset to store statistics for action de-normalization.
         # self.dataset_statistics = {
@@ -125,6 +125,9 @@ class HuggingFaceIterableDataset(IterableDataset):
     def __iter__(self):
         for data in self.dataset:
             # Load data from the dataset
+            # TODO: Replace these several lines.
+            print(data)
+            print(data.keys())
             image = Image.open(data["image_path"])  # Assuming dataset has image paths
             action = np.array(data["action"], dtype=np.float32)  # Assuming actions are stored in this format
             instruction = data["instruction"]  # Assuming instructions are text
