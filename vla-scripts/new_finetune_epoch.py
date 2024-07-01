@@ -115,7 +115,7 @@ class HuggingFaceIterableDataset(IterableDataset):
 
         # Load the dataset
         self.dataset = load_dataset(
-            "mbodiai/utokyo_xarm_pick_place_legacy", streaming=True, split="train", trust_remote_code=True
+            "mbodiai/oxe_bridge", streaming=True, split="all", trust_remote_code=True
         )
 
         # # Note =>> We expect the dataset to store statistics for action de-normalization.
