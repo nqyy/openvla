@@ -93,7 +93,7 @@ class FinetuneConfig:
 
     # Evaluation Parameters
     eval_batch_size: int = 16             # Evaluation batch size
-    eval_steps: int = 100                # Interval for running evaluation
+    eval_steps: int = 10                # Interval for running evaluation
     # fmt: on
 
 
@@ -104,23 +104,17 @@ IGNORE_INDEX = -100
 class XarmDataset(Dataset):
     def __init__(
         self,
-        dataset_name: str,
-        split: str,
-        action_tokenizer: Any,  # You might want to specify the type here
-        base_tokenizer: Any,  # You might want to specify the type here
+        dataset_split: Any,  # Use the appropriate type for your dataset
+        action_tokenizer: Any,
+        base_tokenizer: Any,
         image_transform: Callable[[Image.Image], torch.Tensor],
-        prompt_builder_fn: Type[Any],  # You might want to specify the type here
-        split_ratio: float = 0.2,
+        prompt_builder_fn: Type[Any],
     ) -> None:
         self.action_tokenizer = action_tokenizer
         self.base_tokenizer = base_tokenizer
         self.image_transform = image_transform
         self.prompt_builder_fn = prompt_builder_fn
-
-        dataset = load_dataset(dataset_name, streaming=False, trust_remote_code=True)
-
-        split_data = dataset["train"].train_test_split(test_size=split_ratio)
-        self.dataset = split_data[split]
+        self.dataset = dataset_split
         self.data = list(self.dataset)  # Load the dataset into memory
 
     def __len__(self):
@@ -162,7 +156,6 @@ class XarmDataset(Dataset):
         labels[: -(len(action) + 1)] = IGNORE_INDEX
 
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
-
 
 def evaluate_model(model, dataloader, device, step_idx, distributed_state, action_tokenizer):
     model.eval()
@@ -289,24 +282,27 @@ def finetune(cfg: FinetuneConfig) -> None:
     #       your own Dataset, make sure to add the appropriate logic to the training loop!
     #
     # ---
+    # Load dataset and split it once
+    dataset = load_dataset(cfg.dataset_name, streaming=False, trust_remote_code=True)
+    split_data = dataset["train"].train_test_split(test_size=0.2)
+    train_split = split_data["train"]
+    test_split = split_data["test"]
+
+    # Pass the split datasets to the XarmDataset class
     train_dataset = XarmDataset(
-        cfg.dataset_name,
-        "train",
-        action_tokenizer,
-        processor.tokenizer,
-        processor.image_processor.apply_transform,
-        PurePromptBuilder,
-        split_ratio=0.2,
+        dataset_split=train_split,
+        action_tokenizer=action_tokenizer,
+        base_tokenizer=processor.tokenizer,
+        image_transform=processor.image_processor.apply_transform,
+        prompt_builder_fn=PurePromptBuilder,
     )
 
     test_dataset = XarmDataset(
-        cfg.dataset_name,
-        "test",
-        action_tokenizer,
-        processor.tokenizer,
-        processor.image_processor.apply_transform,
-        PurePromptBuilder,
-        split_ratio=0.2,
+        dataset_split=test_split,
+        action_tokenizer=action_tokenizer,
+        base_tokenizer=processor.tokenizer,
+        image_transform=processor.image_processor.apply_transform,
+        prompt_builder_fn=PurePromptBuilder,
     )
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     # if distributed_state.is_main_process:
