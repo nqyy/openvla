@@ -47,6 +47,7 @@ from datasets import load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig, PreTrainedTokenizerBase
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import get_cosine_schedule_with_warmup
 
 import wandb
 from prismatic.models.backbones.llm.prompting import PromptBuilder, PurePromptBuilder, VicunaV15ChatPromptBuilder
@@ -72,10 +73,11 @@ class FinetuneConfig:
     adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
 
     # Fine-tuning Parameters
+    dataset_size: int = 600                                        # Size of fine-tuning dataset
     batch_size: int = 16                                            # Fine-tuning batch size
-    max_steps: int = 100_000                                        # Max number of fine-tuning steps
+    max_steps: int = 50_000                                        # Max number of fine-tuning steps
     save_steps: int = 5000                                          # Interval for checkpoint saving
-    learning_rate: float = 2e-5                                     # Fine-tuning learning rate
+    learning_rate: float = 1e-5                                     # Fine-tuning learning rate
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
     shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
@@ -95,6 +97,8 @@ class FinetuneConfig:
     eval_batch_size: int = 16             # Evaluation batch size
     eval_steps: int = 10                # Interval for running evaluation
     # fmt: on
+
+    num_warmup_steps: int = 10
 
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
@@ -156,6 +160,7 @@ class XarmDataset(Dataset):
         labels[: -(len(action) + 1)] = IGNORE_INDEX
 
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
+
 
 def evaluate_model(model, dataloader, device, step_idx, distributed_state, action_tokenizer):
     model.eval()
@@ -273,6 +278,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=cfg.num_warmup_steps,  # Adjust this value as needed
+        num_training_steps=cfg.max_steps,
+    )
+
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
@@ -284,7 +295,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # ---
     # Load dataset and split it once
     dataset = load_dataset(cfg.dataset_name, streaming=False, trust_remote_code=True)
-    split_data = dataset["train"].train_test_split(test_size=0.2)
+    split_data = dataset["train"].train_test_split(test_size=0.1)
     train_split = split_data["train"]
     test_split = split_data["test"]
 
@@ -330,8 +341,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
     # Calculate the number of epochs needed to achieve the max_steps
-    dataset_size = 7000
-    steps_per_epoch = dataset_size // cfg.batch_size
+    steps_per_epoch = cfg.dataset_size // cfg.batch_size
     num_epochs = cfg.max_steps // steps_per_epoch + 1
 
     # Initialize Logging =>> W&B
@@ -382,12 +392,18 @@ def finetune(cfg: FinetuneConfig) -> None:
                 # Push Metrics to W&B (every 10 steps)
                 if distributed_state.is_main_process and step_idx % 10 == 0:
                     wandb.log(
-                        {"train_loss": loss, "action_accuracy": action_accuracy, "l1_loss": action_l1_loss},
+                        {
+                            "learning_rate": scheduler.get_last_lr()[0],
+                            "train_loss": loss,
+                            "action_accuracy": action_accuracy,
+                            "l1_loss": action_l1_loss,
+                        },
                         step=step_idx,
                     )
 
                 # Optimizer Step
                 if (step_idx + 1) % cfg.grad_accumulation_steps == 0:
+                    scheduler.step()
                     optimizer.step()
                     optimizer.zero_grad()
                     progress.update()
