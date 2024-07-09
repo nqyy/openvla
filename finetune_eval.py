@@ -126,13 +126,16 @@ class XarmDataset(Dataset):
             "mean": np.array([7.04869162e-03, -4.47613717e-03, -5.16619937e-03, -2.72256749e-05, -2.37738316e-03, -4.07056037e-04, 6.07476636e-01]),
             "q01": np.array([-0.0504155, -0.1054613, -0.08275, -6.28318977, -0.0226686, -0.33344679, 0.0]),
             "q99": np.array([0.0992138, 0.1063098, 0.0832235, 6.28318977, 0.0, 0.2959943, 1.0]),
-            "std": np.array([0.02514272, 0.03889244, 0.03431986, 2.8077106, 0.02850198, 0.07020947, 0.48869292]),
+            "std": np.array([0.02512313, 0.03886214, 0.03429312, 2.80552305, 0.02847977, 0.07015477, 0.48831217]),
         }
 
     def normalize_action(self, action):
-        mean = self.dataset_statistics['mean']
-        std = self.dataset_statistics['std']
-        normalized_action = (action - mean) / (std + 1e-8)
+        q01 = self.dataset_statistics['q01'][:-1]
+        q99 = self.dataset_statistics['q99'][:-1]
+        normalized_action = 2 * (action[:-1] - q01) / (q99 - q01 + 1e-8) - 1
+        normalized_action = np.clip(normalized_action, -1, 1)
+        # Append the grasp value without normalization
+        normalized_action = np.append(normalized_action, action[-1])
         return normalized_action
 
     def __len__(self):
@@ -177,7 +180,16 @@ class XarmDataset(Dataset):
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
 
 
-def evaluate_model(model, dataloader, device, step_idx, distributed_state, action_tokenizer):
+def unnormalize_action(normalized_action, dataset_statistics):
+    normalized_action = np.array(normalized_action)  # Convert to numpy array if it's a list
+    q01 = dataset_statistics['q01'][:-1]
+    q99 = dataset_statistics['q99'][:-1]
+    action = (normalized_action[:-1] + 1) * (q99 - q01 + 1e-8) / 2 + q01
+    # Append the grasp value without normalization
+    action = np.append(action, normalized_action[-1])
+    return action.tolist()
+
+def evaluate_model(model, dataloader, device, step_idx, distributed_state, action_tokenizer, dataset_statistics):
     model.eval()
     total_loss = 0
     total_l1_loss = 0
@@ -221,11 +233,28 @@ def evaluate_model(model, dataloader, device, step_idx, distributed_state, actio
 
                 continuous_actions_gt_list = continuous_actions_gt.tolist()
                 continuous_actions_pred_list = continuous_actions_pred.tolist()
-                nested_continuous_actions_gt_list = [continuous_actions_gt_list[i:i+7] for i in range(0, len(continuous_actions_gt_list), 7)]
-                nested_continuous_actions_pred_list = [continuous_actions_pred_list[i:i+7] for i in range(0, len(continuous_actions_pred_list), 7)]
+
+                nested_continuous_actions_gt_list = [
+                    continuous_actions_gt_list[i : i + 7] for i in range(0, len(continuous_actions_gt_list), 7)
+                ]
+                nested_continuous_actions_pred_list = [
+                    continuous_actions_pred_list[i : i + 7] for i in range(0, len(continuous_actions_pred_list), 7)
+                ]
+                unnormalized_continuous_actions_gt_list = [
+                    unnormalize_action(action, dataset_statistics) for action in nested_continuous_actions_gt_list
+                ]
+                unnormalized_continuous_actions_pred_list = [
+                    unnormalize_action(action, dataset_statistics) for action in nested_continuous_actions_pred_list
+                ]
                 # Log Images with Ground Truth and Predicted Actions as Metadata
-                for img, gt_action, pred_action in zip(batch["pixel_values"].to(torch.float32).cpu().numpy(), nested_continuous_actions_gt_list, nested_continuous_actions_pred_list):
-                    image = img[:3].transpose(1, 2, 0)  # Select first 3 channels and transpose to [height, width, channels]
+                for img, gt_action, pred_action in zip(
+                    batch["pixel_values"].to(torch.float32).cpu().numpy(),
+                    unnormalized_continuous_actions_gt_list,
+                    unnormalized_continuous_actions_pred_list,
+                ):
+                    image = img[:3].transpose(
+                        1, 2, 0
+                    )  # Select first 3 channels and transpose to [height, width, channels]
                     caption = f"Ground Truth: {gt_action}, Predicted: {pred_action}"
                     images_with_metadata.append(wandb.Image(image, caption=caption))
 
@@ -471,7 +500,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                 # Evaluate Model at Regular Intervals
                 if step_idx > 0 and step_idx % cfg.eval_steps == 0:
-                    evaluate_model(vla, eval_dataloader, device_id, step_idx, distributed_state, action_tokenizer)
+                    evaluate_model(vla, eval_dataloader, device_id, step_idx, distributed_state, action_tokenizer, train_dataset.dataset_statistics)
 
                 step_idx += 1
                 if step_idx >= cfg.max_steps:
