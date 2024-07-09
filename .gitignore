@@ -148,3 +148,5 @@ dmypy.json
 cache/
 data/
 wandb/
+runs/
+adapter-tmp/

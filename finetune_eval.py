@@ -39,6 +39,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torchvision import transforms
 
 import tqdm
 from PIL import Image
@@ -77,7 +78,7 @@ class FinetuneConfig:
     batch_size: int = 16                                            # Fine-tuning batch size
     max_steps: int = 50_000                                        # Max number of fine-tuning steps
     save_steps: int = 5000                                          # Interval for checkpoint saving
-    learning_rate: float = 1e-5                                     # Fine-tuning learning rate
+    learning_rate: float = 5e-6                                     # Fine-tuning learning rate
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
     shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
@@ -129,6 +130,20 @@ class XarmDataset(Dataset):
             "std": np.array([0.02512313, 0.03886214, 0.03429312, 2.80552305, 0.02847977, 0.07015477, 0.48831217]),
         }
 
+        self.transform = lambda x: x
+        # Define your transformations / augmentations
+        transform = [
+            transforms.ToTensor(),
+            transforms.RandomApply([
+                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+                # transforms.RandomPerspective(distortion_scale=0.5, p=0.5),
+            ])
+        ]
+        transform.append(transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.2, 2.0), value=0, inplace=False))
+        self.transform = transforms.Compose(transform)
+
+
     def normalize_action(self, action):
         q01 = self.dataset_statistics['q01'][:-1]
         q99 = self.dataset_statistics['q99'][:-1]
@@ -144,6 +159,8 @@ class XarmDataset(Dataset):
     def __getitem__(self, idx):
         data = self.data[idx]
         image = data["observation"]["image"]
+        image = self.transform(image)
+        image = transforms.ToPILImage()(image)
         instruction = data["observation"]["instruction"]
         action = np.array(
             [
