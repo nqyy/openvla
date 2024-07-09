@@ -120,6 +120,20 @@ class XarmDataset(Dataset):
         self.prompt_builder_fn = prompt_builder_fn
         self.dataset = dataset_split
         self.data = list(self.dataset)  # Load the dataset into memory
+        self.dataset_statistics = {
+            "min": np.array([-0.07074, -0.10867, -0.08653, -6.28318977, -0.33160999, -0.33950999, 0.0]),
+            "max": np.array([0.10836, 0.10925, 0.10709, 6.28318977, 0.14999001, 0.33197999, 1.0]),
+            "mean": np.array([7.04869162e-03, -4.47613717e-03, -5.16619937e-03, -2.72256749e-05, -2.37738316e-03, -4.07056037e-04, 6.07476636e-01]),
+            "q01": np.array([-0.0504155, -0.1054613, -0.08275, -6.28318977, -0.0226686, -0.33344679, 0.0]),
+            "q99": np.array([0.0992138, 0.1063098, 0.0832235, 6.28318977, 0.0, 0.2959943, 1.0]),
+            "std": np.array([0.02514272, 0.03889244, 0.03431986, 2.8077106, 0.02850198, 0.07020947, 0.48869292]),
+        }
+
+    def normalize_action(self, action):
+        mean = self.dataset_statistics['mean']
+        std = self.dataset_statistics['std']
+        normalized_action = (action - mean) / (std + 1e-8)
+        return normalized_action
 
     def __len__(self):
         return len(self.data)
@@ -139,6 +153,7 @@ class XarmDataset(Dataset):
                 data["action"]["grasp"],
             ]
         )
+        normalized_action = self.normalize_action(action)
 
         prompt_builder = self.prompt_builder_fn("openvla")
         conversation = [
@@ -146,7 +161,7 @@ class XarmDataset(Dataset):
                 "from": "human",
                 "value": f"What action should the robot take to {instruction}?",
             },
-            {"from": "gpt", "value": self.action_tokenizer(action)},
+            {"from": "gpt", "value": self.action_tokenizer(normalized_action)},
         ]
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
@@ -157,7 +172,7 @@ class XarmDataset(Dataset):
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(image).to(torch.bfloat16)
 
-        labels[: -(len(action) + 1)] = IGNORE_INDEX
+        labels[: -(len(normalized_action) + 1)] = IGNORE_INDEX
 
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
 
@@ -168,6 +183,8 @@ def evaluate_model(model, dataloader, device, step_idx, distributed_state, actio
     total_l1_loss = 0
     total_correct = 0
     total_mask = 0
+
+    images_with_metadata = []
 
     with torch.no_grad():
         for batch in tqdm.tqdm(dataloader, desc="Evaluating"):
@@ -202,12 +219,30 @@ def evaluate_model(model, dataloader, device, step_idx, distributed_state, actio
                 l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
                 total_l1_loss += l1_loss.item()
 
+                continuous_actions_gt_list = continuous_actions_gt.tolist()
+                continuous_actions_pred_list = continuous_actions_pred.tolist()
+                nested_continuous_actions_gt_list = [continuous_actions_gt_list[i:i+7] for i in range(0, len(continuous_actions_gt_list), 7)]
+                nested_continuous_actions_pred_list = [continuous_actions_pred_list[i:i+7] for i in range(0, len(continuous_actions_pred_list), 7)]
+                # Log Images with Ground Truth and Predicted Actions as Metadata
+                for img, gt_action, pred_action in zip(batch["pixel_values"].to(torch.float32).cpu().numpy(), nested_continuous_actions_gt_list, nested_continuous_actions_pred_list):
+                    image = img[:3].transpose(1, 2, 0)  # Select first 3 channels and transpose to [height, width, channels]
+                    caption = f"Ground Truth: {gt_action}, Predicted: {pred_action}"
+                    images_with_metadata.append(wandb.Image(image, caption=caption))
+
     avg_loss = total_loss / len(dataloader)
     avg_accuracy = total_correct / total_mask
     avg_l1_loss = total_l1_loss / len(dataloader)
 
     if distributed_state.is_main_process:
-        wandb.log({"eval_loss": avg_loss, "eval_accuracy": avg_accuracy, "eval_l1_loss": avg_l1_loss}, step=step_idx)
+        wandb.log(
+            {
+                "eval_loss": avg_loss,
+                "eval_accuracy": avg_accuracy,
+                "eval_l1_loss": avg_l1_loss,
+                "eval_images_actions": images_with_metadata,
+            },
+            step=step_idx,
+        )
 
     return avg_loss, avg_accuracy, avg_l1_loss
 
